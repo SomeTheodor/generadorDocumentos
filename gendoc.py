@@ -234,9 +234,10 @@ def analizar_variables(doc: DocxTemplate, datos: dict) -> Analisis:
     presentes = set(contexto.keys())
     faltan = esperadas - presentes
     # Las que sólo se usan como {% if x %} (y adentro de su propio bloque) son
-    # opcionales: si no vienen, valen None y el bloque no se imprime.
+    # opcionales: si no vienen, quedan indefinidas, el {% if %} da falso
+    # (ver _Indefinida) y el bloque no se imprime. No se les pone None porque
+    # `{% if x is defined %}` lo tomaría como presente.
     opcionales = sorted(faltan & variables_opcionales(doc)) if faltan else []
-    contexto = {**contexto, **dict.fromkeys(opcionales)}
     faltantes = sorted(faltan - set(opcionales))
     sin_usar = sorted(presentes - esperadas)
     return Analisis(sorted(esperadas), faltantes, sin_usar, contexto, envoltorios,
@@ -285,6 +286,15 @@ def atributos_faltantes(doc: DocxTemplate, contexto: dict) -> list:
             problemas.setdefault(clave, f"{clave} — {detalle}{extra}")
 
     def recorrer(nodo, alcance):
+        if isinstance(nodo, nodes.Assign) and isinstance(nodo.target, nodes.Name) \
+                and isinstance(nodo.node, nodes.List):
+            # {% set x = [a, b, ...] %}: x pasa a ser la lista de esos valores.
+            valores = []
+            for elem in nodo.node.items:
+                if isinstance(elem, nodes.Name) and elem.name in alcance:
+                    valores.extend(alcance[elem.name][0])
+            alcance[nodo.target.name] = ([valores], None)
+            return
         if isinstance(nodo, nodes.For):
             recorrer(nodo.iter, alcance)
             nuevo = dict(alcance)
@@ -357,31 +367,66 @@ def _guardas(test) -> set:
 def variables_opcionales(doc: DocxTemplate) -> set:
     """Variables que la plantilla sólo usa protegidas por su propio {% if %}:
     p. ej. {% if coaseguro1 %}...{{ coaseguro1.businessName }}...{% endif %}.
-    Si no vienen en el JSON, el bloque simplemente no sale."""
+    Si no vienen en el JSON, el bloque simplemente no sale.
+
+    También el patrón de lista de ítems opcionales:
+        {% set lista = [datagen_1, datagen_2, ...] %}
+        {% for p in lista %}{% if p %}...{{ p.attr3 }}...{% endif %}{% endfor %}
+    donde cada datagen_N que no venga se saltea."""
     from jinja2 import nodes
 
-    guardadas, libres = set(), set()
+    listas = {}   # {% set x = [a, b, ...] %} -> nodo List
 
-    def recorrer(nodo, protegidas):
+    def recorrer(nodo, protegidas, guardadas, libres):
+        if isinstance(nodo, nodes.Assign) and isinstance(nodo.target, nodes.Name) \
+                and isinstance(nodo.node, nodes.List):
+            # Sus elementos se evalúan donde se usa la lista (ver For / Name).
+            listas[nodo.target.name] = nodo.node
+            return
+        if isinstance(nodo, nodes.For) and isinstance(nodo.target, nodes.Name):
+            lista = nodo.iter if isinstance(nodo.iter, nodes.List) else (
+                listas.get(nodo.iter.name) if isinstance(nodo.iter, nodes.Name) else None)
+            if lista is not None:
+                t = nodo.target.name
+                g_cuerpo, l_cuerpo = set(), set()
+                for hijo in nodo.body:
+                    recorrer(hijo, protegidas, g_cuerpo, l_cuerpo)
+                guardadas.update(g_cuerpo - {t})
+                libres.update(l_cuerpo - {t})
+                # Si el ítem del for sólo se usa bajo {% if item %}, los
+                # elementos sueltos de la lista pueden faltar.
+                item_protegido = t in g_cuerpo and t not in l_cuerpo
+                for elem in lista.items:
+                    if item_protegido and isinstance(elem, nodes.Name):
+                        guardadas.add(elem.name)
+                    else:
+                        recorrer(elem, protegidas, guardadas, libres)
+                for hijo in nodo.else_:
+                    recorrer(hijo, protegidas, guardadas, libres)
+                return
         if isinstance(nodo, nodes.If):
             g = _guardas(nodo.test)
             guardadas.update(g)
-            recorrer(nodo.test, protegidas | g)
+            recorrer(nodo.test, protegidas | g, guardadas, libres)
             for hijo in nodo.body:
-                recorrer(hijo, protegidas | g)
+                recorrer(hijo, protegidas | g, guardadas, libres)
             # elif / else corren justamente cuando la guarda es falsa.
             for hijo in nodo.elif_ + nodo.else_:
-                recorrer(hijo, protegidas)
+                recorrer(hijo, protegidas, guardadas, libres)
             return
         if isinstance(nodo, nodes.Name) and nodo.ctx == "load" and nodo.name not in protegidas:
             libres.add(nodo.name)
+            if nodo.name in listas:      # lista usada fuera de un for: sus elementos, libres
+                recorrer(listas[nodo.name], protegidas, guardadas, libres)
         for hijo in nodo.iter_child_nodes():
-            recorrer(hijo, protegidas)
+            recorrer(hijo, protegidas, guardadas, libres)
 
+    guardadas, libres = set(), set()
     env = Environment()
     try:
         for _, xml in _fuentes_jinja(doc):
-            recorrer(env.parse(xml), frozenset())
+            listas.clear()
+            recorrer(env.parse(xml), frozenset(), guardadas, libres)
     except Exception:
         return set()   # ante la duda, nada es opcional (comportamiento estricto)
     return guardadas - libres
@@ -477,8 +522,17 @@ def _raise_syntaxis(doc: DocxTemplate, e: TemplateSyntaxError):
 # --------------------------------------------------------------------------- #
 # 4) Renderizar la plantilla con los datos
 # --------------------------------------------------------------------------- #
+class _Indefinida(StrictUndefined):
+    """Como StrictUndefined (imprimir o acceder a algo que no existe es error),
+    pero en un {% if x %} cuenta como falso: así los bloques opcionales cuyo
+    dato no vino simplemente no salen. Lo que falta de verdad ya lo frena
+    antes analizar_variables."""
+    def __bool__(self):
+        return False
+
+
 def renderizar(doc: DocxTemplate, datos: dict, salida_docx: Path):
-    env = Environment(undefined=StrictUndefined)
+    env = Environment(undefined=_Indefinida)
     try:
         doc.render(datos, jinja_env=env)
     except TemplateSyntaxError as e:

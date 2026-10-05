@@ -76,7 +76,16 @@ Si una variable sólo se usa dentro de su propio `{% if %}`, por ejemplo
 `{% if coaseguro1 %}…{{ coaseguro1.businessName }}…{% endif %}`, se la toma
 como opcional: si no viene en el JSON, no cuenta como faltante y el bloque
 simplemente no se imprime. Si se usa también fuera de su `{% if %}`, sigue
-siendo obligatoria.
+siendo obligatoria. Sirven tanto `{% if x %}` como `{% if x is defined %}`.
+
+Lo mismo para listas de ítems opcionales:
+
+```
+{% set lista = [datagen_1, datagen_2, …, datagen_10] %}
+{% for p in lista %}{% if p %} … {{ p.attr3 }} … {% endif %}{% endfor %}
+```
+
+Los `datagen_N` que no vengan en el JSON se saltean.
 
 ## Qué te dice cuando falla
 - JSON mal formado → línea y columna (las comas de más antes de un `}` o `]` no frenan la generación: se ignoran y te avisa)
