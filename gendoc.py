@@ -259,13 +259,57 @@ def atributos_faltantes(doc: DocxTemplate, contexto: dict) -> list:
     """Recorre la plantilla y, para cada `x.y.z` que use, se fija que el JSON
     tenga esos atributos. También dentro de los {% for a in lista %}, contra
     cada elemento de la lista. Devuelve textos como
-    "cont_1.commissionPercent — «cont_1» no tiene «commissionPercent»"."""
+    "cont_1.commissionPercent — «cont_1» no tiene «commissionPercent»".
+
+    Un atributo protegido no cuenta como faltante si no viene, porque la
+    plantilla ya contempla que falte:
+        {% if a.b %}…{{ a.b.c }}…{% endif %}   (también `a.b is defined`)
+        {{ a.b | default(…) }}      {{ a.b or … }}      {{ … if a.b else … }}
+    Sirve para plantillas compartidas entre productos, p. ej.
+        {% set rc = policy.rc_bascic_mop | default(policy.rc_base) %}"""
     import difflib
     from jinja2 import nodes
 
     problemas = {}   # ruta -> texto (sin repetir)
+    _FALTA = object()
 
-    def chequear(raiz, attrs, valores, origen):
+    def ruta_de(nodo):
+        c = _cadena(nodo) if isinstance(nodo, nodes.Getattr) else None
+        return ".".join([c[0], *c[1]]) if c else None
+
+    def guardas(test):
+        """Rutas `a.b` que, si no vienen, hacen falso el test."""
+        if isinstance(test, nodes.Test) and test.name == "defined":
+            test = test.node
+        if isinstance(test, nodes.And):
+            return guardas(test.left) | guardas(test.right)
+        r = ruta_de(test)
+        return {r} if r else set()
+
+    def resolver(nodo, alcance):
+        """Valores posibles de una expresión `a.b`, `a.b | default(c.d)` o
+        `a.b or c.d`, para seguir chequeando lo que se haga con un {% set %}."""
+        if isinstance(nodo, nodes.Filter) and nodo.name in ("default", "d") and nodo.args:
+            pares = (nodo.node, nodo.args[0])
+        elif isinstance(nodo, nodes.Or):
+            pares = (nodo.left, nodo.right)
+        else:
+            c = _cadena(nodo)
+            if not (c and c[0] in alcance):
+                return None
+            valores = []
+            for v in alcance[c[0]][0]:
+                for attr in c[1]:
+                    v = v.get(attr, _FALTA) if isinstance(v, dict) else _FALTA
+                valores.append(v)
+            return valores
+        a, b = resolver(pares[0], alcance), resolver(pares[1], alcance)
+        if a is None:
+            return None
+        resto = b[0] if b and len(b) == 1 else _FALTA
+        return [resto if v is _FALTA or v is None else v for v in a]
+
+    def chequear(raiz, attrs, valores, origen, protegidas):
         fallos, detalle = 0, None
         for v in valores:
             ruta = raiz
@@ -273,6 +317,8 @@ def atributos_faltantes(doc: DocxTemplate, contexto: dict) -> list:
                 if not isinstance(v, dict):
                     break          # None (bloque opcional), lista, etc.: no opinamos
                 if attr not in v:
+                    if f"{ruta}.{attr}" in protegidas:
+                        break      # la plantilla ya contempla que falte
                     fallos += 1
                     parecidos = difflib.get_close_matches(attr, list(v), n=1)
                     detalle = (f"«{ruta}» no tiene «{attr}»"
@@ -285,7 +331,7 @@ def atributos_faltantes(doc: DocxTemplate, contexto: dict) -> list:
                      if origen else "")
             problemas.setdefault(clave, f"{clave} — {detalle}{extra}")
 
-    def recorrer(nodo, alcance):
+    def recorrer(nodo, alcance, protegidas=frozenset()):
         if isinstance(nodo, nodes.Assign) and isinstance(nodo.target, nodes.Name) \
                 and isinstance(nodo.node, nodes.List):
             # {% set x = [a, b, ...] %}: x pasa a ser la lista de esos valores.
@@ -295,8 +341,43 @@ def atributos_faltantes(doc: DocxTemplate, contexto: dict) -> list:
                     valores.extend(alcance[elem.name][0])
             alcance[nodo.target.name] = ([valores], None)
             return
+        if isinstance(nodo, nodes.Assign) and isinstance(nodo.target, nodes.Name):
+            # {% set x = a.b | default(c.d) %}: se sigue chequeando x.algo.
+            recorrer(nodo.node, alcance, protegidas)
+            valores = resolver(nodo.node, alcance)
+            if valores is None:
+                alcance.pop(nodo.target.name, None)
+            else:
+                alcance[nodo.target.name] = (valores, None)
+            return
+        if isinstance(nodo, nodes.If):
+            g = protegidas | guardas(nodo.test)
+            recorrer(nodo.test, alcance, g)
+            for hijo in nodo.body:
+                recorrer(hijo, alcance, g)
+            # elif / else corren justamente cuando la guarda es falsa.
+            for hijo in nodo.elif_ + nodo.else_:
+                recorrer(hijo, alcance, protegidas)
+            return
+        if isinstance(nodo, nodes.CondExpr):
+            g = protegidas | guardas(nodo.test)
+            recorrer(nodo.test, alcance, g)
+            recorrer(nodo.expr1, alcance, g)
+            if nodo.expr2 is not None:
+                recorrer(nodo.expr2, alcance, protegidas)
+            return
+        if isinstance(nodo, nodes.Or) or (isinstance(nodo, nodes.Filter)
+                                          and nodo.name in ("default", "d")):
+            # `a.b or …` / `a.b | default(…)`: a.b puede faltar.
+            izq = nodo.left if isinstance(nodo, nodes.Or) else nodo.node
+            r = ruta_de(izq)
+            recorrer(izq, alcance, protegidas | {r} if r else protegidas)
+            for hijo in nodo.iter_child_nodes():
+                if hijo is not izq:
+                    recorrer(hijo, alcance, protegidas)
+            return
         if isinstance(nodo, nodes.For):
-            recorrer(nodo.iter, alcance)
+            recorrer(nodo.iter, alcance, protegidas)
             nuevo = dict(alcance)
             c = _cadena(nodo.iter)
             if isinstance(nodo.target, nodes.Name):
@@ -311,18 +392,18 @@ def atributos_faltantes(doc: DocxTemplate, contexto: dict) -> list:
                     nombre_lista = ".".join([c[0], *c[1]])
                     nuevo[nodo.target.name] = (items, nombre_lista)
             for hijo in nodo.body:
-                recorrer(hijo, nuevo)
+                recorrer(hijo, nuevo, protegidas)
             for hijo in nodo.else_:
-                recorrer(hijo, alcance)
+                recorrer(hijo, alcance, protegidas)
             return
         if isinstance(nodo, nodes.Getattr):
             c = _cadena(nodo)
             if c and c[0] in alcance:
                 valores, origen = alcance[c[0]]
-                chequear(c[0], c[1], valores, origen)
+                chequear(c[0], c[1], valores, origen, protegidas)
                 return
         for hijo in nodo.iter_child_nodes():
-            recorrer(hijo, alcance)
+            recorrer(hijo, alcance, protegidas)
 
     alcance = {k: ([v], None) for k, v in contexto.items()}
     env = Environment()

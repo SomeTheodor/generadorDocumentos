@@ -87,6 +87,21 @@ Lo mismo para listas de ítems opcionales:
 
 Los `datagen_N` que no vengan en el JSON se saltean.
 
+## Una plantilla para varios productos
+Si dos productos comparten plantilla pero el dato viene en objetos distintos
+(p. ej. RC MOP trae `rc_bascic_mop` y RC General sólo `rc_base`), elegí el
+objeto una vez al principio del Word y usá el alias en el resto:
+
+```
+{% set rc = policy.rc_bascic_mop | default(policy.rc_base) %}
+{{ rc.coverageValue }}  {{ rc.modality }}  {{ rc.textDeductible }}
+```
+
+Un atributo así protegido no cuenta como faltante si no viene. También sirven
+`{% if a.b %}…{{ a.b.c }}…{% endif %}` (o `a.b is defined`), `a.b or …` y
+`… if a.b else …`. Los atributos del alias (`rc.coverageValue`) se siguen
+validando contra el objeto que corresponda.
+
 ## Qué te dice cuando falla
 - JSON mal formado → línea y columna (las comas de más antes de un `}` o `]` no frenan la generación: se ignoran y te avisa)
 - Variable que la plantilla espera y no está en el JSON → nombre exacto (y `--check`/Validar las listan todas)
